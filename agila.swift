@@ -328,7 +328,7 @@ private func translateTypeSwiftToAgila(_ raw: String) -> String {
 }
 
 // Convert Pythonic `f"Hello {name}!"` to Swift `"Hello \(name)!"`
-private func convertFStringToSwift(_ contentBytes: [UInt8]) -> String {
+private func convertFStringToSwift(_ contentBytes: [UInt8], quoteChar: UInt8 = 0x22) -> String {
     var out = "\""
     var i = 0
     while i < contentBytes.count {
@@ -337,6 +337,11 @@ private func convertFStringToSwift(_ contentBytes: [UInt8]) -> String {
             out.append(Character(UnicodeScalar(c)))
             out.append(Character(UnicodeScalar(contentBytes[i + 1])))
             i += 2
+            continue
+        }
+        if quoteChar == 0x27 && c == 0x22 {
+            out += "\\\""
+            i += 1
             continue
         }
         if c == 0x7B { // '{'
@@ -348,7 +353,36 @@ private func convertFStringToSwift(_ contentBytes: [UInt8]) -> String {
             let closeIdx = findMatchingDelim(contentBytes, openIdx: i, openCh: 0x7B, closeCh: 0x7D)
             if closeIdx < contentBytes.count {
                 let exprStr = String(decoding: contentBytes[(i + 1)..<closeIdx], as: UTF8.self)
-                out += "\\(" + translateTokensAgilaToSwift(exprStr) + ")"
+                // Check optional `:spec` format specifier at top level
+                let eb = Array(exprStr.utf8)
+                var depth = 0
+                var q: UInt8 = 0
+                var colPos: Int? = nil
+                var k = 0
+                while k < eb.count {
+                    let ch = eb[k]
+                    if q != 0 {
+                        if ch == 0x5C && k + 1 < eb.count { k += 2; continue }
+                        if ch == q { q = 0 }
+                    } else if ch == 0x22 || ch == 0x27 {
+                        q = ch
+                    } else if ch == 0x28 || ch == 0x5B || ch == 0x7B {
+                        depth += 1
+                    } else if ch == 0x29 || ch == 0x5D || ch == 0x7D {
+                        depth -= 1
+                    } else if ch == 0x3A && depth == 0 {
+                        colPos = k
+                        break
+                    }
+                    k += 1
+                }
+                if let cp = colPos {
+                    let epart = trimASCII(String(decoding: eb[0..<cp], as: UTF8.self))
+                    let spec = trimASCII(String(decoding: eb[(cp + 1)..<eb.count], as: UTF8.self))
+                    out += "\\(String(format: \"%\(spec)\", " + translateTokensAgilaToSwift(epart) + "))"
+                } else {
+                    out += "\\(" + translateTokensAgilaToSwift(exprStr) + ")"
+                }
                 i = closeIdx + 1
                 continue
             }
@@ -360,7 +394,7 @@ private func convertFStringToSwift(_ contentBytes: [UInt8]) -> String {
         }
         let start = i
         i += 1
-        while i < contentBytes.count && contentBytes[i] != 0x5C && contentBytes[i] != 0x7B && contentBytes[i] != 0x7D {
+        while i < contentBytes.count && contentBytes[i] != 0x5C && contentBytes[i] != 0x7B && contentBytes[i] != 0x7D && !(quoteChar == 0x27 && contentBytes[i] == 0x22) {
             i += 1
         }
         out += String(decoding: contentBytes[start..<i], as: UTF8.self)
@@ -417,7 +451,414 @@ private func convertSwiftStringToAgila(_ contentBytes: [UInt8]) -> String {
 // Expression Token Translation (Agila -> Swift)
 // -------------------------------------------------------------------------
 
+private var agilaUsedInHelper = false
+private var agilaUsedFloorDiv = false
+private var agilaUsedPow = false
+
+private func findTopLevelKwAgila(_ s: String, _ kw: String) -> Int? {
+    let bytes = Array(s.utf8)
+    let kb = Array(kw.utf8)
+    if bytes.count < kb.count { return nil }
+    var depth = 0
+    var quote: UInt8 = 0
+    var i = 0
+    while i + kb.count <= bytes.count {
+        let c = bytes[i]
+        if quote != 0 {
+            if c == 0x5C && i + 1 < bytes.count { i += 2; continue }
+            if c == quote { quote = 0 }
+            i += 1
+            continue
+        }
+        if c == 0x22 || c == 0x27 {
+            quote = c
+            i += 1
+            continue
+        }
+        if c == 0x28 || c == 0x5B || c == 0x7B {
+            depth += 1
+        } else if c == 0x29 || c == 0x5D || c == 0x7D {
+            if depth > 0 { depth -= 1 }
+        } else if depth == 0 && Array(bytes[i..<(i + kb.count)]) == kb {
+            let leftOk = (i == 0 || !isIdentCont(bytes[i - 1]))
+            let rightOk = (i + kb.count == bytes.count || !isIdentCont(bytes[i + kb.count]))
+            if leftOk && rightOk { return i }
+        }
+        i += 1
+    }
+    return nil
+}
+
+private func findTopLevelTokAgila(_ s: String, _ tok: String) -> Int? {
+    let bytes = Array(s.utf8)
+    let tb = Array(tok.utf8)
+    if bytes.count < tb.count { return nil }
+    var depth = 0
+    var quote: UInt8 = 0
+    var i = 0
+    while i + tb.count <= bytes.count {
+        let c = bytes[i]
+        if quote != 0 {
+            if c == 0x5C && i + 1 < bytes.count { i += 2; continue }
+            if c == quote { quote = 0 }
+            i += 1
+            continue
+        }
+        if c == 0x22 || c == 0x27 {
+            quote = c
+            i += 1
+            continue
+        }
+        if c == 0x28 || c == 0x5B || c == 0x7B {
+            depth += 1
+        } else if c == 0x29 || c == 0x5D || c == 0x7D {
+            if depth > 0 { depth -= 1 }
+        } else if depth == 0 && Array(bytes[i..<(i + tb.count)]) == tb {
+            return i
+        }
+        i += 1
+    }
+    return nil
+}
+
+private func hasTopLevelAssignOrSepAgila(_ s: String) -> Bool {
+    let bytes = Array(s.utf8)
+    var depth = 0
+    var quote: UInt8 = 0
+    var i = 0
+    while i < bytes.count {
+        let c = bytes[i]
+        if quote != 0 {
+            if c == 0x5C && i + 1 < bytes.count { i += 2; continue }
+            if c == quote { quote = 0 }
+            i += 1
+            continue
+        }
+        if c == 0x22 || c == 0x27 { quote = c; i += 1; continue }
+        if c == 0x28 || c == 0x5B || c == 0x7B { depth += 1 }
+        else if c == 0x29 || c == 0x5D || c == 0x7D { if depth > 0 { depth -= 1 } }
+        else if depth == 0 {
+            if c == 0x2C || c == 0x3B { return true }
+            if c == 0x3D {
+                if (i + 1 < bytes.count && (bytes[i + 1] == 0x3D || bytes[i + 1] == 0x3E)) ||
+                   (i > 0 && [0x3D, 0x21, 0x3C, 0x3E, 0x2B, 0x2D, 0x2A, 0x2F, 0x25, 0x26, 0x7C, 0x5E].contains(bytes[i - 1])) {
+                    i += 1
+                    continue
+                }
+                return true
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
+private func trySplitTernaryAgila(_ s: String) -> (String, String, String)? {
+    guard let ifIdx = findTopLevelKwAgila(s, "if"), ifIdx > 0 else { return nil }
+    let bytes = Array(s.utf8)
+    let rest = String(decoding: bytes[(ifIdx + 2)..<bytes.count], as: UTF8.self)
+    guard let elseRel = findTopLevelKwAgila(rest, "else"), elseRel > 0 else { return nil }
+    let rb = Array(rest.utf8)
+    let t = trimASCII(String(decoding: bytes[0..<ifIdx], as: UTF8.self))
+    let c = trimASCII(String(decoding: rb[0..<elseRel], as: UTF8.self))
+    let f = trimASCII(String(decoding: rb[(elseRel + 4)..<rb.count], as: UTF8.self))
+    if t.isEmpty || c.isEmpty || f.isEmpty { return nil }
+    return (t, c, f)
+}
+
+private func trySplitChainedCmpAgila(_ s: String) -> ([String], [String])? {
+    let bytes = Array(s.utf8)
+    var operands: [String] = []
+    var ops: [String] = []
+    var depth = 0
+    var quote: UInt8 = 0
+    var last = 0
+    var i = 0
+    while i < bytes.count {
+        let c = bytes[i]
+        if quote != 0 {
+            if c == 0x5C && i + 1 < bytes.count { i += 2; continue }
+            if c == quote { quote = 0 }
+            i += 1
+            continue
+        }
+        if c == 0x22 || c == 0x27 { quote = c; i += 1; continue }
+        if c == 0x28 || c == 0x5B || c == 0x7B { depth += 1 }
+        else if c == 0x29 || c == 0x5D || c == 0x7D { if depth > 0 { depth -= 1 } }
+        else if depth == 0 {
+            if (c == 0x3C || c == 0x3E) && (i + 1 >= bytes.count || bytes[i + 1] != c) && (i == 0 || bytes[i - 1] != c) {
+                if c == 0x3E && i > 0 && (bytes[i - 1] == 0x2D || bytes[i - 1] == 0x3D) {
+                    i += 1; continue
+                }
+                if c == 0x3C && (i + 2 < bytes.count && bytes[i + 1] == 0x3C) {
+                    i += 1; continue
+                }
+                let opLen = (i + 1 < bytes.count && bytes[i + 1] == 0x3D) ? 2 : 1
+                operands.append(trimASCII(String(decoding: bytes[last..<i], as: UTF8.self)))
+                ops.append(String(decoding: bytes[i..<(i + opLen)], as: UTF8.self))
+                i += opLen
+                last = i
+                continue
+            } else if (c == 0x3D || c == 0x21) && i + 1 < bytes.count && bytes[i + 1] == 0x3D {
+                operands.append(trimASCII(String(decoding: bytes[last..<i], as: UTF8.self)))
+                ops.append(String(decoding: bytes[i..<(i + 2)], as: UTF8.self))
+                i += 2
+                last = i
+                continue
+            }
+        }
+        i += 1
+    }
+    if ops.count < 2 { return nil }
+    operands.append(trimASCII(String(decoding: bytes[last..<bytes.count], as: UTF8.self)))
+    if operands.contains(where: { $0.isEmpty }) { return nil }
+    return (operands, ops)
+}
+
+private func hasComparisonOpAgila(_ s: String) -> Bool {
+    let bytes = Array(s.utf8)
+    var depth = 0
+    var quote: UInt8 = 0
+    var i = 0
+    while i < bytes.count {
+        let c = bytes[i]
+        if quote != 0 {
+            if c == 0x5C && i + 1 < bytes.count { i += 2; continue }
+            if c == quote { quote = 0 }
+            i += 1
+            continue
+        }
+        if c == 0x22 || c == 0x27 { quote = c; i += 1; continue }
+        if c == 0x28 || c == 0x5B || c == 0x7B { depth += 1 }
+        else if c == 0x29 || c == 0x5D || c == 0x7D { if depth > 0 { depth -= 1 } }
+        else if depth == 0 {
+            if c == 0x3C || c == 0x3E {
+                if !(c == 0x3E && i > 0 && (bytes[i - 1] == 0x2D || bytes[i - 1] == 0x3D)) {
+                    return true
+                }
+            } else if (c == 0x3D || c == 0x21) && i + 1 < bytes.count && bytes[i + 1] == 0x3D {
+                return true
+            }
+        }
+        i += 1
+    }
+    return findTopLevelKwAgila(s, "in") != nil || findTopLevelKwAgila(s, "is") != nil
+}
+
+private func translateLambdaAgila(_ rest: String) -> (swiftCode: String, consumed: Int)? {
+    let bytes = Array(rest.utf8)
+    var idx = 0
+    while idx < bytes.count && bytes[idx] == 0x20 { idx += 1 }
+    var paramsStr = ""
+    var retStr = ""
+    var bodyColon: Int? = nil
+
+    if idx < bytes.count && bytes[idx] == 0x28 {
+        let rp = findMatchingDelim(bytes, openIdx: idx, openCh: 0x28, closeCh: 0x29)
+        if rp >= bytes.count { return nil }
+        paramsStr = String(decoding: bytes[(idx + 1)..<rp], as: UTF8.self)
+        var after = rp + 1
+        while after < bytes.count && bytes[after] == 0x20 { after += 1 }
+        let afterStr = String(decoding: bytes[after..<bytes.count], as: UTF8.self)
+        if afterStr.hasPrefix("->") {
+            let tail = String(afterStr.dropFirst(2))
+            guard let colRel = findTopLevelTokAgila(tail, ":") else { return nil }
+            let tb = Array(tail.utf8)
+            retStr = trimASCII(String(decoding: tb[0..<colRel], as: UTF8.self))
+            bodyColon = after + 2 + colRel
+        } else if after < bytes.count && bytes[after] == 0x3A {
+            bodyColon = after
+        } else {
+            return nil
+        }
+    } else {
+        var depth = 0
+        var quote: UInt8 = 0
+        var arrowIdx: Int? = nil
+        var colons: [Int] = []
+        var k = idx
+        while k < bytes.count {
+            let c = bytes[k]
+            if quote != 0 {
+                if c == 0x5C && k + 1 < bytes.count { k += 2; continue }
+                if c == quote { quote = 0 }
+                k += 1
+                continue
+            }
+            if c == 0x22 || c == 0x27 { quote = c }
+            else if c == 0x28 || c == 0x5B || c == 0x7B { depth += 1 }
+            else if c == 0x29 || c == 0x5D || c == 0x7D {
+                if depth == 0 { break }
+                depth -= 1
+            } else if depth == 0 {
+                if c == 0x2D && k + 1 < bytes.count && bytes[k + 1] == 0x3E {
+                    arrowIdx = k
+                    break
+                }
+                if c == 0x3A { colons.append(k) }
+            }
+            k += 1
+        }
+        if let ai = arrowIdx {
+            paramsStr = trimASCII(String(decoding: bytes[idx..<ai], as: UTF8.self))
+            let tail = String(decoding: bytes[(ai + 2)..<bytes.count], as: UTF8.self)
+            guard let colRel = findTopLevelTokAgila(tail, ":") else { return nil }
+            let tb = Array(tail.utf8)
+            retStr = trimASCII(String(decoding: tb[0..<colRel], as: UTF8.self))
+            bodyColon = ai + 2 + colRel
+        } else if let lc = colons.last {
+            paramsStr = trimASCII(String(decoding: bytes[idx..<lc], as: UTF8.self))
+            bodyColon = lc
+        } else {
+            return nil
+        }
+    }
+
+    guard let bc = bodyColon else { return nil }
+    let bodyStart = bc + 1
+    var bodyEnd = bytes.count
+    var depth = 0
+    var quote: UInt8 = 0
+    var k = bodyStart
+    while k < bytes.count {
+        let c = bytes[k]
+        if quote != 0 {
+            if c == 0x5C && k + 1 < bytes.count { k += 2; continue }
+            if c == quote { quote = 0 }
+            k += 1
+            continue
+        }
+        if c == 0x22 || c == 0x27 { quote = c }
+        else if c == 0x28 || c == 0x5B || c == 0x7B { depth += 1 }
+        else if c == 0x29 || c == 0x5D || c == 0x7D {
+            if depth == 0 { bodyEnd = k; break }
+            depth -= 1
+        } else if c == 0x2C && depth == 0 {
+            bodyEnd = k
+            break
+        }
+        k += 1
+    }
+    let body = trimASCII(String(decoding: bytes[bodyStart..<bodyEnd], as: UTF8.self))
+    if body.isEmpty { return nil }
+
+    var swiftParams = ""
+    let trimmedP = trimASCII(paramsStr)
+    if !trimmedP.isEmpty {
+        // Parse `a: T, b: U` or `a, b`
+        var parts: [String] = []
+        var segStart = 0
+        var d = 0
+        let pb = Array(trimmedP.utf8)
+        for pIdx in 0...pb.count {
+            if pIdx < pb.count {
+                if pb[pIdx] == 0x28 || pb[pIdx] == 0x5B { d += 1 }
+                else if pb[pIdx] == 0x29 || pb[pIdx] == 0x5D { d -= 1 }
+            }
+            if pIdx == pb.count || (pb[pIdx] == 0x2C && d == 0) {
+                let p = trimASCII(String(decoding: pb[segStart..<pIdx], as: UTF8.self))
+                if !p.isEmpty {
+                    if let col = findTopLevelTokAgila(p, ":") {
+                        let pbb = Array(p.utf8)
+                        let pn = trimASCII(String(decoding: pbb[0..<col], as: UTF8.self))
+                        let pt = trimASCII(String(decoding: pbb[(col + 1)..<pbb.count], as: UTF8.self))
+                        parts.append("\(pn): \(translateTypeAgilaToSwift(pt))")
+                    } else {
+                        parts.append(p)
+                    }
+                }
+                segStart = pIdx + 1
+            }
+        }
+        swiftParams = parts.joined(separator: ", ")
+    }
+
+    let swBody = translateTokensAgilaToSwift(body)
+    let swRet = retStr.isEmpty ? "" : " -> " + translateTypeAgilaToSwift(retStr)
+    if swiftParams.isEmpty && swRet.isEmpty {
+        return ("{ \(swBody) }", bodyEnd)
+    }
+    return ("{ (\(swiftParams))\(swRet) in \(swBody) }", bodyEnd)
+}
+
 private func translateTokensAgilaToSwift(_ s: String) -> String {
+    let trimmed = trimASCII(s)
+    if !hasTopLevelAssignOrSepAgila(trimmed) && findTopLevelKwAgila(trimmed, "lambda") == nil {
+        if let (tE, cE, fE) = trySplitTernaryAgila(trimmed) {
+            return "(" + translateTokensAgilaToSwift(cE) + " ? " + translateTokensAgilaToSwift(tE) + " : " + translateTokensAgilaToSwift(fE) + ")"
+        }
+        if let orIdx = findTopLevelKwAgila(trimmed, "or"), orIdx > 0 {
+            let tb = Array(trimmed.utf8)
+            let l = trimASCII(String(decoding: tb[0..<orIdx], as: UTF8.self))
+            let r = trimASCII(String(decoding: tb[(orIdx + 2)..<tb.count], as: UTF8.self))
+            return translateTokensAgilaToSwift(l) + " || " + translateTokensAgilaToSwift(r)
+        }
+        if let andIdx = findTopLevelKwAgila(trimmed, "and"), andIdx > 0 {
+            let tb = Array(trimmed.utf8)
+            let l = trimASCII(String(decoding: tb[0..<andIdx], as: UTF8.self))
+            let r = trimASCII(String(decoding: tb[(andIdx + 3)..<tb.count], as: UTF8.self))
+            return translateTokensAgilaToSwift(l) + " && " + translateTokensAgilaToSwift(r)
+        }
+        if let afterNot = startsWithKw(trimmed, "not"), !afterNot.isEmpty {
+            if let inIdx = findTopLevelKwAgila(afterNot, "in"), inIdx > 0 {
+                agilaUsedInHelper = true
+                let ab = Array(afterNot.utf8)
+                let k = trimASCII(String(decoding: ab[0..<inIdx], as: UTF8.self))
+                let m = trimASCII(String(decoding: ab[(inIdx + 2)..<ab.count], as: UTF8.self))
+                return "!_agilaIn(\(translateTokensAgilaToSwift(m)), \(translateTokensAgilaToSwift(k)))"
+            }
+            if hasComparisonOpAgila(afterNot) {
+                return "!(\(translateTokensAgilaToSwift(afterNot)))"
+            }
+        }
+        if let notIdx = findTopLevelKwAgila(trimmed, "not"), notIdx > 0 {
+            let tb = Array(trimmed.utf8)
+            let afterN = trimASCII(String(decoding: tb[(notIdx + 3)..<tb.count], as: UTF8.self))
+            if let inAfter = startsWithKw(afterN, "in"), !inAfter.isEmpty {
+                agilaUsedInHelper = true
+                let k = trimASCII(String(decoding: tb[0..<notIdx], as: UTF8.self))
+                return "!_agilaIn(\(translateTokensAgilaToSwift(inAfter)), \(translateTokensAgilaToSwift(k)))"
+            }
+        }
+        if let inIdx = findTopLevelKwAgila(trimmed, "in"), inIdx > 0 {
+            agilaUsedInHelper = true
+            let tb = Array(trimmed.utf8)
+            let k = trimASCII(String(decoding: tb[0..<inIdx], as: UTF8.self))
+            let m = trimASCII(String(decoding: tb[(inIdx + 2)..<tb.count], as: UTF8.self))
+            return "_agilaIn(\(translateTokensAgilaToSwift(m)), \(translateTokensAgilaToSwift(k)))"
+        }
+        if let isIdx = findTopLevelKwAgila(trimmed, "is"), isIdx > 0 {
+            let tb = Array(trimmed.utf8)
+            let l = trimASCII(String(decoding: tb[0..<isIdx], as: UTF8.self))
+            let rhs = trimASCII(String(decoding: tb[(isIdx + 2)..<tb.count], as: UTF8.self))
+            if let afterNot = startsWithKw(rhs, "not"), !afterNot.isEmpty {
+                return translateTokensAgilaToSwift(l) + " != " + translateTokensAgilaToSwift(afterNot)
+            }
+            return translateTokensAgilaToSwift(l) + " == " + translateTokensAgilaToSwift(rhs)
+        }
+        if let (operands, ops) = trySplitChainedCmpAgila(trimmed) {
+            var parts: [String] = []
+            for k in 0..<ops.count {
+                parts.append("(\(translateTokensAgilaToSwift(operands[k])) \(ops[k]) \(translateTokensAgilaToSwift(operands[k + 1])))")
+            }
+            return parts.joined(separator: " && ")
+        }
+        if let flIdx = findTopLevelTokAgila(trimmed, "//"), flIdx > 0 {
+            agilaUsedFloorDiv = true
+            let tb = Array(trimmed.utf8)
+            let l = trimASCII(String(decoding: tb[0..<flIdx], as: UTF8.self))
+            let r = trimASCII(String(decoding: tb[(flIdx + 2)..<tb.count], as: UTF8.self))
+            return "_agilaFloorDiv(\(translateTokensAgilaToSwift(l)), \(translateTokensAgilaToSwift(r)))"
+        }
+        if let pwIdx = findTopLevelTokAgila(trimmed, "**"), pwIdx > 0 {
+            agilaUsedPow = true
+            let tb = Array(trimmed.utf8)
+            let l = trimASCII(String(decoding: tb[0..<pwIdx], as: UTF8.self))
+            let r = trimASCII(String(decoding: tb[(pwIdx + 2)..<tb.count], as: UTF8.self))
+            return "_agilaPow(\(translateTokensAgilaToSwift(l)), \(translateTokensAgilaToSwift(r)))"
+        }
+    }
+
     let bytes = Array(s.utf8)
     let len = bytes.count
     var out = ""
@@ -427,19 +868,20 @@ private func translateTokensAgilaToSwift(_ s: String) -> String {
     while i < len {
         let c = bytes[i]
 
-        // Pythonic f-string `f"..."`
-        if c == 0x66 && i + 1 < len && bytes[i + 1] == 0x22 && (i == 0 || !isIdentCont(bytes[i - 1])) {
+        // Pythonic f-string `f"..."` or `f'...'`
+        if c == 0x66 && i + 1 < len && (bytes[i + 1] == 0x22 || bytes[i + 1] == 0x27) && (i == 0 || !isIdentCont(bytes[i - 1])) {
+            let q = bytes[i + 1]
             var endQ = i + 2
             while endQ < len {
                 if bytes[endQ] == 0x5C && endQ + 1 < len {
                     endQ += 2
                     continue
                 }
-                if bytes[endQ] == 0x22 { break }
+                if bytes[endQ] == q { break }
                 endQ += 1
             }
             if endQ < len {
-                out += convertFStringToSwift(Array(bytes[(i + 2)..<endQ]))
+                out += convertFStringToSwift(Array(bytes[(i + 2)..<endQ]), quoteChar: q)
                 i = endQ + 1
                 continue
             }
@@ -468,6 +910,81 @@ private func translateTokensAgilaToSwift(_ s: String) -> String {
             while i < len && isIdentCont(bytes[i]) { i += 1 }
             let word = String(decoding: bytes[start..<i], as: UTF8.self)
             let isMember = (start > 0 && bytes[start - 1] == 0x2E)
+
+            if !isMember && word == "lambda" && i < len && (bytes[i] == 0x20 || bytes[i] == 0x28 || bytes[i] == 0x3A) {
+                if let lam = translateLambdaAgila(String(decoding: bytes[i..<len], as: UTF8.self)) {
+                    out += lam.swiftCode
+                    i += lam.consumed
+                    continue
+                }
+            }
+
+            if !isMember && word == "isinstance" && i < len && bytes[i] == 0x28 {
+                let closeP = findMatchingDelim(bytes, openIdx: i, openCh: 0x28, closeCh: 0x29)
+                if closeP < len {
+                    let argsStr = String(decoding: bytes[(i + 1)..<closeP], as: UTF8.self)
+                    if let comma = findTopLevelComma(argsStr) {
+                        let valPart = trimASCII(String(argsStr[..<comma]))
+                        let typePart = trimASCII(String(argsStr[argsStr.index(after: comma)...]))
+                        out += "(" + translateTokensAgilaToSwift(valPart) + " is " + translateTypeAgilaToSwift(typePart) + ")"
+                        i = closeP + 1
+                        continue
+                    }
+                }
+            }
+
+            if !isMember && word == "reversed" && i < len && bytes[i] == 0x28 {
+                let closeP = findMatchingDelim(bytes, openIdx: i, openCh: 0x28, closeCh: 0x29)
+                if closeP < len {
+                    let innerStr = trimASCII(String(decoding: bytes[(i + 1)..<closeP], as: UTF8.self))
+                    out += translateTokensAgilaToSwift(innerStr) + ".reversed()"
+                    i = closeP + 1
+                    continue
+                }
+            }
+
+            if !isMember && word == "enumerate" && i < len && bytes[i] == 0x28 {
+                let closeP = findMatchingDelim(bytes, openIdx: i, openCh: 0x28, closeCh: 0x29)
+                if closeP < len {
+                    let innerStr = trimASCII(String(decoding: bytes[(i + 1)..<closeP], as: UTF8.self))
+                    out += translateTokensAgilaToSwift(innerStr) + ".enumerated()"
+                    i = closeP + 1
+                    continue
+                }
+            }
+
+            // Negative integer index `xs[-1]` -> `xs[xs.count - 1]` and slicing `xs[a:b]` -> `Array(xs[a..<b])`
+            if !isMember && i < len && bytes[i] == 0x5B {
+                let closeB = findMatchingDelim(bytes, openIdx: i, openCh: 0x5B, closeCh: 0x5D)
+                if closeB < len {
+                    let idxStr = trimASCII(String(decoding: bytes[(i + 1)..<closeB], as: UTF8.self))
+                    if idxStr.hasPrefix("-") {
+                        let restDigits = String(idxStr.dropFirst())
+                        if !restDigits.isEmpty && restDigits.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) {
+                            out += "\(word)[\(word).count - \(restDigits)]"
+                            i = closeB + 1
+                            continue
+                        }
+                    } else if let colPos = findTopLevelTokAgila(idxStr, ":") {
+                        let ib = Array(idxStr.utf8)
+                        let aPart = trimASCII(String(decoding: ib[0..<colPos], as: UTF8.self))
+                        let bPart = trimASCII(String(decoding: ib[(colPos + 1)..<ib.count], as: UTF8.self))
+                        if !aPart.isEmpty && !bPart.isEmpty && !bPart.contains(":") {
+                            out += "Array(\(word)[\(translateTokensAgilaToSwift(aPart))..<\(translateTokensAgilaToSwift(bPart))])"
+                            i = closeB + 1
+                            continue
+                        } else if !aPart.isEmpty && bPart.isEmpty {
+                            out += "Array(\(word)[\(translateTokensAgilaToSwift(aPart))...])"
+                            i = closeB + 1
+                            continue
+                        } else if aPart.isEmpty && !bPart.isEmpty && !bPart.contains(":") {
+                            out += "Array(\(word)[..<\(translateTokensAgilaToSwift(bPart))])"
+                            i = closeB + 1
+                            continue
+                        }
+                    }
+                }
+            }
 
             // `addr[...]` or `list[...]` or `set[...]` or `dict[...]` inside expressions
             if !isMember && (word == "addr" || word == "list" || word == "set" || word == "unordered_set" || word == "dict" || word == "unordered_map") &&
@@ -1059,8 +1576,31 @@ private func tryEmitForIn(_ expr: String) -> String? {
     if let colonIdx = varPart.firstIndex(of: ":") {
         vname = trimASCII(String(varPart[..<colonIdx]))
     }
+    if vname.contains(",") && !(vname.hasPrefix("(") && vname.hasSuffix(")")) {
+        vname = "(\(vname))"
+    }
 
     let rb = Array(rhs.utf8)
+    if rhs.hasPrefix("enumerate(") && findMatchingDelim(rb, openIdx: 9, openCh: 0x28, closeCh: 0x29) == rb.count - 1 {
+        let inner = trimASCII(String(rhs.dropFirst(10).dropLast()))
+        return "for \(vname) in \(translateTokensAgilaToSwift(inner)).enumerated() {"
+    }
+    if rhs.hasPrefix("reversed(") && findMatchingDelim(rb, openIdx: 8, openCh: 0x28, closeCh: 0x29) == rb.count - 1 {
+        let inner = trimASCII(String(rhs.dropFirst(9).dropLast()))
+        if inner.hasPrefix("range(") {
+            let ib = Array(inner.utf8)
+            if findMatchingDelim(ib, openIdx: 5, openCh: 0x28, closeCh: 0x29) == ib.count - 1 {
+                let rargs = String(inner.dropFirst(6).dropLast())
+                if let comma = findTopLevelComma(rargs) {
+                    let a = translateTokensAgilaToSwift(trimASCII(String(rargs[..<comma])))
+                    let b = translateTokensAgilaToSwift(trimASCII(String(rargs[rargs.index(after: comma)...])))
+                    return "for \(vname) in (\(a)..<\(b)).reversed() {"
+                }
+                return "for \(vname) in (0..<\(translateTokensAgilaToSwift(rargs))).reversed() {"
+            }
+        }
+        return "for \(vname) in \(translateTokensAgilaToSwift(inner)).reversed() {"
+    }
     if rhs.hasPrefix("range(") && findMatchingDelim(rb, openIdx: 5, openCh: 0x28, closeCh: 0x29) == rb.count - 1 {
         let rargs = String(rhs.dropFirst(6).dropLast())
         // Split top-level commas (up to 3 args)
@@ -1124,75 +1664,55 @@ private func tryEmitAgilaComprehension(
         return nil
     }
 
-    let innerBytes = Array(vb[1..<(vb.count - 1)])
-    let innerLen = innerBytes.count
-
-    // Find top-level ` for `
-    var forIdx: Int? = nil
-    var depth = 0
-    var quote: UInt8 = 0
-    var i = 0
-    while i + 5 <= innerLen {
-        let c = innerBytes[i]
-        if quote != 0 {
-            if c == 0x5C && i + 1 < innerLen { i += 2; continue }
-            if c == quote { quote = 0 }
-            i += 1
-            continue
-        }
-        if c == 0x22 || c == 0x27 { quote = c }
-        else if c == 0x28 || c == 0x5B || c == 0x7B { depth += 1 }
-        else if c == 0x29 || c == 0x5D || c == 0x7D { depth -= 1 }
-        else if depth == 0 && String(decoding: innerBytes[i..<(i + 5)], as: UTF8.self) == " for " {
-            forIdx = i
-            break
-        }
-        i += 1
-    }
-    guard let fi = forIdx else { return nil }
-
-    let head = trimASCII(String(decoding: innerBytes[0..<fi], as: UTF8.self))
+    let inner = String(decoding: vb[1..<(vb.count - 1)], as: UTF8.self)
+    guard let forIdx = findTopLevelKwAgila(inner, "for"), forIdx > 0 else { return nil }
+    let ib = Array(inner.utf8)
+    let head = trimASCII(String(decoding: ib[0..<forIdx], as: UTF8.self))
     if head.isEmpty { return nil }
 
-    let afterForBytes = Array(innerBytes[(fi + 5)..<innerLen])
-    let afterForLen = afterForBytes.count
-
-    var inIdx: Int? = nil
-    var ifIdx: Int? = nil
-    depth = 0
-    quote = 0
-    i = 0
-    while i < afterForLen {
-        let c = afterForBytes[i]
-        if quote != 0 {
-            if c == 0x5C && i + 1 < afterForLen { i += 2; continue }
-            if c == quote { quote = 0 }
-            i += 1
-            continue
+    // Parse 1 or more `var in iter [if cond...]` clauses
+    var clauses: [(forClause: String, conds: [String])] = []
+    var rem = trimASCII(String(decoding: ib[(forIdx + 3)..<ib.count], as: UTF8.self))
+    while !rem.isEmpty {
+        guard let inIdx = findTopLevelKwAgila(rem, "in"), inIdx > 0 else { return nil }
+        let rb = Array(rem.utf8)
+        let lhsPart = trimASCII(String(decoding: rb[0..<inIdx], as: UTF8.self))
+        let afterIn = trimASCII(String(decoding: rb[(inIdx + 2)..<rb.count], as: UTF8.self))
+        let ab = Array(afterIn.utf8)
+        let seg: String
+        if let nf = findTopLevelKwAgila(afterIn, "for") {
+            seg = trimASCII(String(decoding: ab[0..<nf], as: UTF8.self))
+            rem = trimASCII(String(decoding: ab[(nf + 3)..<ab.count], as: UTF8.self))
+        } else {
+            seg = afterIn
+            rem = ""
         }
-        if c == 0x22 || c == 0x27 { quote = c }
-        else if c == 0x28 || c == 0x5B || c == 0x7B { depth += 1 }
-        else if c == 0x29 || c == 0x5D || c == 0x7D { depth -= 1 }
-        else if depth == 0 {
-            if inIdx == nil && i + 4 <= afterForLen && String(decoding: afterForBytes[i..<(i + 4)], as: UTF8.self) == " in " {
-                inIdx = i
-            } else if inIdx != nil && i + 4 <= afterForLen && String(decoding: afterForBytes[i..<(i + 4)], as: UTF8.self) == " if " {
-                ifIdx = i
-                break
+        var conds: [String] = []
+        let iterPart: String
+        if let firstIf = findTopLevelKwAgila(seg, "if") {
+            let sb = Array(seg.utf8)
+            iterPart = trimASCII(String(decoding: sb[0..<firstIf], as: UTF8.self))
+            var ctail = trimASCII(String(decoding: sb[(firstIf + 2)..<sb.count], as: UTF8.self))
+            if ctail.isEmpty { return nil }
+            while !ctail.isEmpty {
+                if let ni = findTopLevelKwAgila(ctail, "if") {
+                    let cb = Array(ctail.utf8)
+                    let c = trimASCII(String(decoding: cb[0..<ni], as: UTF8.self))
+                    if c.isEmpty { return nil }
+                    conds.append(c)
+                    ctail = trimASCII(String(decoding: cb[(ni + 2)..<cb.count], as: UTF8.self))
+                } else {
+                    conds.append(ctail)
+                    break
+                }
             }
+        } else {
+            iterPart = seg
         }
-        i += 1
+        if iterPart.isEmpty { return nil }
+        clauses.append((forClause: "\(lhsPart) in \(iterPart)", conds: conds))
     }
-    guard inIdx != nil else { return nil }
-
-    let forClauseEnd = ifIdx ?? afterForLen
-    let forClause = trimASCII(String(decoding: afterForBytes[0..<forClauseEnd], as: UTF8.self))
-    var condStr: String? = nil
-    if let ifi = ifIdx {
-        let c = trimASCII(String(decoding: afterForBytes[(ifi + 4)..<afterForLen], as: UTF8.self))
-        if c.isEmpty { return nil }
-        condStr = c
-    }
+    if clauses.isEmpty { return nil }
 
     var kind: CompKind = .list
     var keyStr = ""
@@ -1201,8 +1721,8 @@ private func tryEmitAgilaComprehension(
     if !isBracket {
         let hb = Array(head.utf8)
         var colonIdx: Int? = nil
-        depth = 0
-        quote = 0
+        var depth = 0
+        var quote: UInt8 = 0
         var qmarkDepth = 0
         var k = 0
         while k < hb.count {
@@ -1243,22 +1763,27 @@ private func tryEmitAgilaComprehension(
     case .dict: initExpr = "[:]"
     }
 
-    let ind0 = String(repeating: swiftIndent, count: level)
-    let ind1 = String(repeating: swiftIndent, count: level + 1)
-    let ind2 = String(repeating: swiftIndent, count: level + 2)
-
     var out = "var \(lhs): \(swiftType) = \(initExpr)\n"
-    if let forLine = tryEmitForIn(forClause) {
-        out += "\(ind0)\(forLine)\n"
-    } else {
-        out += "\(ind0)for \(translateTokensAgilaToSwift(forClause)) {\n"
+    var curLevel = level
+    var closers: [Int] = []
+    for cl in clauses {
+        let ind = String(repeating: swiftIndent, count: curLevel)
+        if let forLine = tryEmitForIn(cl.forClause) {
+            out += "\(ind)\(forLine)\n"
+        } else {
+            out += "\(ind)for \(translateTokensAgilaToSwift(cl.forClause)) {\n"
+        }
+        closers.append(curLevel)
+        curLevel += 1
+        for cond in cl.conds {
+            let cInd = String(repeating: swiftIndent, count: curLevel)
+            out += "\(cInd)if \(translateTokensAgilaToSwift(cond)) {\n"
+            closers.append(curLevel)
+            curLevel += 1
+        }
     }
 
-    if let cond = condStr {
-        out += "\(ind1)if \(translateTokensAgilaToSwift(cond)) {\n"
-    }
-
-    let bodyInd = condStr != nil ? ind2 : ind1
+    let bodyInd = String(repeating: swiftIndent, count: curLevel)
     switch kind {
     case .list:
         out += "\(bodyInd)\(lhs).append(\(translateTokensAgilaToSwift(elemStr)))\n"
@@ -1268,10 +1793,10 @@ private func tryEmitAgilaComprehension(
         out += "\(bodyInd)\(lhs)[\(translateTokensAgilaToSwift(keyStr))] = \(translateTokensAgilaToSwift(elemStr))\n"
     }
 
-    if condStr != nil {
-        out += "\(ind1)}\n"
+    for (ci, cLvl) in closers.reversed().enumerated() {
+        let cInd = String(repeating: swiftIndent, count: cLvl)
+        out += "\(cInd)}" + (ci + 1 < closers.count ? "\n" : "")
     }
-    out += "\(ind0)}"
     return out
 }
 
@@ -1390,17 +1915,221 @@ private func findDeclColon(_ s: String) -> (lhs: String, typePart: String, valPa
     }
 }
 
-public func agilaToSwift(_ src: String) throws -> String {
-    let bytes = Array(src.utf8)
-    let len = bytes.count
+private struct LogicalLineAgila {
+    let lineNo: Int
+    let raw: String
+}
 
+private func preprocessLogicalLinesAgila(_ src: String) throws -> [LogicalLineAgila] {
+    let bytes = Array(src.utf8)
+    var rawLines: [String] = []
+    var p = 0
+    while p < bytes.count {
+        let ls = p
+        while p < bytes.count && bytes[p] != 0x0A && bytes[p] != 0x0D { p += 1 }
+        rawLines.append(String(decoding: bytes[ls..<p], as: UTF8.self))
+        if p < bytes.count {
+            if bytes[p] == 0x0D && p + 1 < bytes.count && bytes[p + 1] == 0x0A { p += 2 }
+            else { p += 1 }
+        }
+    }
+
+    func updateDepth(_ code: String, _ parenDepth: inout Int) {
+        let b = Array(code.utf8)
+        var q: UInt8 = 0
+        var i = 0
+        while i < b.count {
+            let c = b[i]
+            if q != 0 {
+                if c == 0x5C && i + 1 < b.count { i += 2; continue }
+                if c == q { q = 0 }
+                i += 1
+                continue
+            }
+            if c == 0x22 || c == 0x27 { q = c; i += 1; continue }
+            if c == 0x28 || c == 0x5B || c == 0x7B { parenDepth += 1 }
+            else if (c == 0x29 || c == 0x5D || c == 0x7D) && parenDepth > 0 { parenDepth -= 1 }
+            i += 1
+        }
+    }
+
+    func escapeSingleLineAgila(_ body: String, isF: Bool) -> String {
+        var out = isF ? "f\"" : "\""
+        for c in body {
+            if c == "\n" { out += "\\n" }
+            else if c == "\"" { out += "\\\"" }
+            else { out.append(c) }
+        }
+        return out + "\""
+    }
+
+    func findTripleStartAgila(_ s: String) -> (idx: Int, delim: String, isF: Bool)? {
+        let b = Array(s.utf8)
+        var q: UInt8 = 0
+        var i = 0
+        while i < b.count {
+            let c = b[i]
+            if q != 0 {
+                if c == 0x5C && i + 1 < b.count { i += 2; continue }
+                if c == q { q = 0 }
+                i += 1
+                continue
+            }
+            if c == 0x23 && (i == 0 || b[i - 1] == 0x20 || b[i - 1] == 0x09) { break }
+            let sub = String(decoding: b[i..<b.count], as: UTF8.self)
+            if sub.hasPrefix("f\"\"\"") && (i == 0 || !isIdentCont(b[i - 1])) { return (i, "\"\"\"", true) }
+            if sub.hasPrefix("f'''") && (i == 0 || !isIdentCont(b[i - 1])) { return (i, "'''", true) }
+            if sub.hasPrefix("\"\"\"") { return (i, "\"\"\"", false) }
+            if sub.hasPrefix("'''") { return (i, "'''", false) }
+            if c == 0x22 || c == 0x27 { q = c }
+            i += 1
+        }
+        return nil
+    }
+
+    func collapseSameLineAgila(_ s: String) -> String {
+        var cur = s
+        while let ts = findTripleStartAgila(cur) {
+            let cb = Array(cur.utf8)
+            let startOff = ts.idx + (ts.isF ? 4 : 3)
+            let tail = String(decoding: cb[startOff..<cb.count], as: UTF8.self)
+            guard let closeR = tail.range(of: ts.delim) else { break }
+            let body = String(tail[..<closeR.lowerBound])
+            let rest = String(tail[closeR.upperBound...])
+            let prefix = String(decoding: cb[0..<ts.idx], as: UTF8.self)
+            cur = prefix + escapeSingleLineAgila(body, isF: ts.isF) + rest
+        }
+        return cur
+    }
+
+    var result: [LogicalLineAgila] = []
+    var curLineNo = 0
+    var acc = ""
+    var parenDepth = 0
+    var continued = false
+    var tripleQuote: String? = nil
+    var tripleF = false
+    var tripleBody = ""
+
+    for (idx, raw) in rawLines.enumerated() {
+        let lineNo = idx + 1
+        if let delim = tripleQuote {
+            if let closeR = raw.range(of: delim) {
+                tripleBody += "\n" + String(raw[..<closeR.lowerBound])
+                let rest = String(raw[closeR.upperBound...])
+                acc += escapeSingleLineAgila(tripleBody, isF: tripleF) + collapseSameLineAgila(rest)
+                tripleQuote = nil
+                tripleBody = ""
+                let trimmedAcc = String(acc.drop(while: { $0 == " " || $0 == "\t" }))
+                let (code, _) = splitInlineHashComment(trimmedAcc)
+                parenDepth = 0
+                updateDepth(code, &parenDepth)
+                continued = acc.hasSuffix("\\")
+                if continued {
+                    acc = String(acc.dropLast()).replacingOccurrences(of: "[ \\t]+$", with: "", options: .regularExpression) + " "
+                } else if parenDepth == 0 {
+                    result.append(LogicalLineAgila(lineNo: curLineNo, raw: acc))
+                    acc = ""
+                }
+            } else {
+                tripleBody += "\n" + raw
+            }
+            continue
+        }
+
+        if parenDepth == 0 && !continued {
+            if raw.utf8.allSatisfy({ $0 == 0x20 || $0 == 0x09 }) {
+                result.append(LogicalLineAgila(lineNo: lineNo, raw: raw))
+                continue
+            }
+            if raw.hasSuffix(" ") || raw.hasSuffix("\t") {
+                throw AgilaError("trailing whitespace is not allowed", line: lineNo, col: raw.utf8.count)
+            }
+            curLineNo = lineNo
+        }
+
+        let line = collapseSameLineAgila(raw)
+        if let ts = findTripleStartAgila(line) {
+            let lb = Array(line.utf8)
+            let startOff = ts.idx + (ts.isF ? 4 : 3)
+            let prefix = String(decoding: lb[0..<ts.idx], as: UTF8.self)
+            if !acc.isEmpty {
+                acc += " " + String(prefix.drop(while: { $0 == " " || $0 == "\t" }))
+            } else {
+                acc = prefix
+            }
+            tripleQuote = ts.delim
+            tripleF = ts.isF
+            tripleBody = String(decoding: lb[startOff..<lb.count], as: UTF8.self)
+            continue
+        }
+
+        if parenDepth > 0 || continued {
+            let chunk = trimASCII(line)
+            let (code, _) = splitInlineHashComment(chunk)
+            if code.hasSuffix("\\") {
+                acc += " " + trimASCII(String(code.dropLast()))
+                continued = true
+                continue
+            }
+            continued = false
+            if acc.hasSuffix("(") || acc.hasSuffix("[") || acc.hasSuffix("{") {
+                acc += code
+            } else if !code.isEmpty {
+                acc += " " + code
+            }
+            parenDepth = 0
+            let trimmedAcc = String(acc.drop(while: { $0 == " " || $0 == "\t" }))
+            let (cCode, _) = splitInlineHashComment(trimmedAcc)
+            updateDepth(cCode, &parenDepth)
+            if parenDepth == 0 {
+                result.append(LogicalLineAgila(lineNo: curLineNo, raw: acc))
+                acc = ""
+            }
+            continue
+        }
+
+        let trimmedStart = String(line.drop(while: { $0 == " " || $0 == "\t" }))
+        let (code, inlineC) = splitInlineHashComment(trimmedStart)
+        if inlineC == nil && line.hasSuffix("\\") {
+            acc = String(line.dropLast().reversed().drop(while: { $0 == " " || $0 == "\t" }).reversed())
+            continued = true
+            continue
+        }
+        updateDepth(code, &parenDepth)
+        if parenDepth > 0 {
+            let wsLen = line.utf8.count - trimmedStart.utf8.count
+            let lb = Array(line.utf8)
+            acc = String(decoding: lb[0..<wsLen], as: UTF8.self) + code
+        } else {
+            result.append(LogicalLineAgila(lineNo: lineNo, raw: line))
+        }
+    }
+
+    if tripleQuote != nil {
+        throw AgilaError("unterminated triple-quoted string", line: curLineNo, col: 1)
+    }
+    if !acc.isEmpty {
+        result.append(LogicalLineAgila(lineNo: curLineNo, raw: acc))
+    }
+    return result
+}
+
+public func agilaToSwift(_ src: String) throws -> String {
+    let rawBytes = Array(src.utf8)
     // Reject UTF-8 BOM
-    if len >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+    if rawBytes.count >= 3 && rawBytes[0] == 0xEF && rawBytes[1] == 0xBB && rawBytes[2] == 0xBF {
         throw AgilaError("UTF-8 BOM is not allowed", line: 1, col: 1)
     }
 
+    agilaUsedInHelper = false
+    agilaUsedFloorDiv = false
+    agilaUsedPow = false
+
+    let logicalLines = try preprocessLogicalLinesAgila(src)
+
     var out = ""
-    out.reserveCapacity(len * 2 + 128)
+    out.reserveCapacity(rawBytes.count * 2 + 128)
 
     var indentChar: UInt8 = 0
     var indentWidth = 0
@@ -1408,34 +2137,28 @@ public func agilaToSwift(_ src: String) throws -> String {
     var currentLevel = 0
     var prevLineOpenedBlock = false
     var prevBlockLine = 0
+    var hasFoundationImport = false
 
     let swiftIndent = "    "
-    var p = 0
-    var lineNo = 0
 
-    while p < len {
-        lineNo += 1
-        let lineStart = p
-        while p < len && bytes[p] != 0x0A && bytes[p] != 0x0D { p += 1 }
-        let lineEnd = p
-        if p < len {
-            if bytes[p] == 0x0D && p + 1 < len && bytes[p + 1] == 0x0A { p += 2 }
-            else { p += 1 }
-        }
+    for ll in logicalLines {
+        let lineNo = ll.lineNo
+        let bytes = Array(ll.raw.utf8)
+        let len = bytes.count
 
         // Measure leading whitespace
         var ws = 0
         var hasSpace = false
         var hasTab = false
-        while lineStart + ws < lineEnd {
-            let c = bytes[lineStart + ws]
+        while ws < len {
+            let c = bytes[ws]
             if c == 0x20 { hasSpace = true; ws += 1 }
             else if c == 0x09 { hasTab = true; ws += 1 }
             else { break }
         }
 
         // Blank line?
-        if lineStart + ws == lineEnd {
+        if ws == len {
             out += "\n"
             continue
         }
@@ -1445,8 +2168,8 @@ public func agilaToSwift(_ src: String) throws -> String {
         }
 
         // Check for trailing whitespace
-        if bytes[lineEnd - 1] == 0x20 || bytes[lineEnd - 1] == 0x09 {
-            throw AgilaError("trailing whitespace is not allowed", line: lineNo, col: lineEnd - lineStart)
+        if bytes[len - 1] == 0x20 || bytes[len - 1] == 0x09 {
+            throw AgilaError("trailing whitespace is not allowed", line: lineNo, col: len)
         }
 
         var level = 0
@@ -1470,7 +2193,7 @@ public func agilaToSwift(_ src: String) throws -> String {
             }
         }
 
-        let content = String(decoding: bytes[(lineStart + ws)..<lineEnd], as: UTF8.self)
+        let content = String(decoding: bytes[ws..<len], as: UTF8.self)
 
         if prevLineOpenedBlock && !content.hasPrefix("#") {
             if level != currentLevel {
@@ -1535,13 +2258,16 @@ public func agilaToSwift(_ src: String) throws -> String {
 
         // Module imports: `import Foundation` or `from Foundation import Date`
         if let imp = startsWithKw(code, "import") {
-            out += ind + "import " + imp
+            let impClean = trimASCII(imp)
+            if impClean == "Foundation" { hasFoundationImport = true }
+            out += ind + "import " + impClean
             if let ic = inlineComment { out += " //" + ic }
             out += "\n"
             continue
         }
         if let f = startsWithKw(code, "from") {
             let modName = f.split(separator: " ").first.map(String.init) ?? f
+            if modName == "Foundation" { hasFoundationImport = true }
             out += ind + "import " + modName + "\n"
             continue
         }
@@ -1611,6 +2337,20 @@ public func agilaToSwift(_ src: String) throws -> String {
                     out += ind + forLine
                 } else {
                     out += ind + "for " + translateTokensAgilaToSwift(fexpr) + " {"
+                }
+                stack.append(BlockFrame(level: level, kind: .normal))
+                currentLevel = level + 1
+                prevLineOpenedBlock = true
+                prevBlockLine = lineNo
+            } else if let wexpr = startsWithKw(header, "with") {
+                out += ind + "do {\n"
+                if let asIdx = findTopLevelKwAgila(wexpr, "as"), asIdx > 0 {
+                    let wb = Array(wexpr.utf8)
+                    let exprS = trimASCII(String(decoding: wb[0..<asIdx], as: UTF8.self))
+                    let vname = trimASCII(String(decoding: wb[(asIdx + 2)..<wb.count], as: UTF8.self))
+                    out += ind + swiftIndent + "let \(vname) = \(translateTokensAgilaToSwift(exprS))"
+                } else {
+                    out += ind + swiftIndent + translateTokensAgilaToSwift(wexpr)
                 }
                 stack.append(BlockFrame(level: level, kind: .normal))
                 currentLevel = level + 1
@@ -1762,10 +2502,50 @@ public func agilaToSwift(_ src: String) throws -> String {
             } else {
                 out += ind + "\(kw) \(lhs): \(translateTypeAgilaToSwift(decl.typePart))"
             }
+        } else if let raiseExpr = startsWithKw(code, "raise") {
+            out += ind + "throw " + translateTokensAgilaToSwift(raiseExpr)
+        } else if let delExpr = startsWithKw(code, "del"), !delExpr.isEmpty {
+            let db = Array(delExpr.utf8)
+            var obOpt: Int? = nil
+            var bdep = 0
+            var bq: UInt8 = 0
+            var k = 0
+            while k < db.count {
+                let c = db[k]
+                if bq != 0 {
+                    if c == 0x5C && k + 1 < db.count { k += 2; continue }
+                    if c == bq { bq = 0 }
+                    k += 1; continue
+                }
+                if c == 0x22 || c == 0x27 { bq = c; k += 1; continue }
+                if c == 0x28 || c == 0x5B || c == 0x7B {
+                    if c == 0x5B && bdep == 0 { obOpt = k }
+                    bdep += 1
+                } else if (c == 0x29 || c == 0x5D || c == 0x7D) && bdep > 0 {
+                    bdep -= 1
+                }
+                k += 1
+            }
+            if let ob = obOpt, db.last == 0x5D {
+                let mExpr = trimASCII(String(decoding: db[0..<ob], as: UTF8.self))
+                let kExpr = trimASCII(String(decoding: db[(ob + 1)..<(db.count - 1)], as: UTF8.self))
+                out += ind + "\(translateTokensAgilaToSwift(mExpr)).removeValue(forKey: \(translateTokensAgilaToSwift(kExpr)))"
+            } else {
+                out += ind + translateTokensAgilaToSwift(code)
+            }
+        } else if let retExpr = startsWithKw(code, "return") {
+            if retExpr.isEmpty {
+                out += ind + "return"
+            } else {
+                out += ind + "return " + translateTokensAgilaToSwift(retExpr)
+            }
         } else if let varRest = startsWithKw(code, "var"), let eqIdx = varRest.firstIndex(of: "="),
                   !varRest.contains("=="), !varRest.contains("!="), !varRest.contains("<="), !varRest.contains(">=") {
-            let vname = trimASCII(String(varRest[..<eqIdx]))
+            var vname = trimASCII(String(varRest[..<eqIdx]))
             let rhs = trimASCII(String(varRest[varRest.index(after: eqIdx)...]))
+            if vname.contains(",") && !(vname.hasPrefix("(") && vname.hasSuffix(")")) {
+                vname = "(\(vname))"
+            }
             out += ind + "var \(vname) = \(translateTokensAgilaToSwift(rhs))"
         } else if level == 0, let eqIdx = code.firstIndex(of: "="),
                   !code.contains("=="), !code.contains("!="), !code.contains("<="), !code.contains(">=") {
@@ -1793,6 +2573,31 @@ public func agilaToSwift(_ src: String) throws -> String {
         if frame.kind != .caseBlock {
             out += String(repeating: swiftIndent, count: frame.level) + "}\n"
         }
+    }
+
+    if agilaUsedPow && !hasFoundationImport {
+        out = "import Foundation\n\n" + out
+    }
+    if agilaUsedInHelper {
+        out += "\nprivate func _agilaIn<T: Equatable>(_ c: [T], _ k: T) -> Bool { return c.contains(k) }\n"
+        out += "private func _agilaIn<T: Hashable>(_ c: Set<T>, _ k: T) -> Bool { return c.contains(k) }\n"
+        out += "private func _agilaIn<K: Hashable, V>(_ c: [K: V], _ k: K) -> Bool { return c[k] != nil }\n"
+        out += "private func _agilaIn(_ c: String, _ k: String) -> Bool { return c.contains(k) }\n"
+    }
+    if agilaUsedFloorDiv {
+        out += "\nprivate func _agilaFloorDiv(_ a: Int, _ b: Int) -> Int { return Int(floor(Double(a) / Double(b))) }\n"
+        out += "private func _agilaFloorDiv(_ a: Int32, _ b: Int32) -> Int32 { return Int32(floor(Double(a) / Double(b))) }\n"
+        out += "private func _agilaFloorDiv(_ a: Int64, _ b: Int64) -> Int64 { return Int64(floor(Double(a) / Double(b))) }\n"
+        out += "private func _agilaFloorDiv(_ a: Double, _ b: Double) -> Double { return floor(a / b) }\n"
+        if !agilaUsedPow && !hasFoundationImport {
+            out = "import Foundation\n\n" + out
+        }
+    }
+    if agilaUsedPow {
+        out += "\nprivate func _agilaPow(_ a: Int, _ b: Int) -> Int { return Int(pow(Double(a), Double(b))) }\n"
+        out += "private func _agilaPow(_ a: Int32, _ b: Int32) -> Int32 { return Int32(pow(Double(a), Double(b))) }\n"
+        out += "private func _agilaPow(_ a: Int64, _ b: Int64) -> Int64 { return Int64(pow(Double(a), Double(b))) }\n"
+        out += "private func _agilaPow(_ a: Double, _ b: Double) -> Double { return pow(a, b) }\n"
     }
 
     return out
@@ -2419,6 +3224,42 @@ private func runTests() -> Int32 {
         passed += 1
     } catch {
         fputs("FAIL [universal_newlines]: \(error)\n", stderr)
+        return 1
+    }
+
+    // Extended Pythonic syntax test
+    do {
+        let pyAgila = """
+        import Foundation
+
+        def test_py():
+            doc: str = \"""hello
+        world\"""
+            nums: list[isize] = [
+                x + y
+                for x in range(3)
+                for y in range(2)
+                if x + y > 0
+            ]
+            var inc = lambda x: isize -> isize: x + 1
+            tag: str = "big" if 2 in nums and 9 not in nums else "small"
+            var opt: isize? = nil
+            ok: bool = 0 < nums[0] < 10 and not 1 == 2 and opt is nil
+            fv: isize = -7 // 2
+            pv: isize = 2 ** 3
+            last_v: isize = nums[-1]
+            sl: list[isize] = nums[1:3]
+            msg: str = f'tag={tag} {3.14159:.2f}'
+            print(doc.count + inc(1) + fv + pv + last_v + sl.count + (ok ? 1 : 0) + msg.count)
+        """
+        let swOut = try agilaToSwift(pyAgila)
+        if !swOut.contains("_agilaFloorDiv") || !swOut.contains("_agilaPow") || !swOut.contains("_agilaIn") {
+            fputs("FAIL [extended_pythonic]:\n\(swOut)", stderr)
+            return 1
+        }
+        passed += 1
+    } catch {
+        fputs("FAIL [extended_pythonic]: \(error)\n", stderr)
         return 1
     }
 
