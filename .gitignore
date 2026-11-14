@@ -1,0 +1,21 @@
+# Built binaries
+/agila
+/shapes
+/hello
+/tabs
+/comprehensions
+/cal
+/lmon
+
+# Swift build artifacts
+/.build/
+/Packages/
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+*.o
+*.out
+*.dSYM/
+
+# OS / Editor files
+.DS_Store

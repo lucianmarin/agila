@@ -1,0 +1,18 @@
+# Tab-indented Agila demonstrating auto-detected \t indentation
+import Foundation
+
+def fib(n: i32) -> i64:
+	if n <= 1:
+		return i64(n)
+	var a: i64 = 0
+	var b: i64 = 1
+	for _ in range(2, n + 1):
+		next: i64 = a + b
+		a = b
+		b = next
+	return b
+
+def main():
+	fibs: list[i64] = [fib(i32(k)) for k in range(10)]
+	for k in range(10):
+		print(f"fib({k}) = {fibs[k]}")

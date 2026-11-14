@@ -1,0 +1,18 @@
+# Minimal introduction to Agila types, functions, comprehensions, and loops
+import Foundation
+
+MAX_GREETINGS = 3
+
+def greet(name: str, count: i32) -> i32:
+    if name.isEmpty or count <= 0:
+        return 0
+    steps: list[i32] = [i + 1 for i in range(i32(MAX_GREETINGS))]
+    for i in range(count):
+        idx: isize = isize(i)
+        print(f"[{steps[idx]}] Hello from Agila, {name}!")
+    return count
+
+def main():
+    sent: i32 = greet("World", i32(MAX_GREETINGS))
+    if sent > 0 and not (sent > 10):
+        print(f"Successfully sent {sent} greetings.")

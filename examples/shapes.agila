@@ -1,0 +1,36 @@
+# Structs, enums, references (`ref[T]`), type casts (`cast`), and switch/case in Agila
+import Foundation
+
+enum ShapeKind(i32):
+    circle = 0
+    rectangle = 1
+
+struct Vec2:
+    x: f64
+    y: f64
+
+struct Shape:
+    kind: ShapeKind
+    origin: Vec2
+    width: f64
+    height: f64
+
+def scale_shape(s: ref[Shape], factor: f64):
+    s.width *= factor
+    s.height *= factor
+
+def area(s: Shape) -> f64:
+    switch s.kind:
+        case .circle:
+            return 3.141592653589793 * s.width * s.width
+        case .rectangle:
+            return s.width * s.height
+
+def main():
+    radii: list[f64] = [f64(i + 1) * 2.5 for i in range(3)]
+    for i in range(3):
+        var c: Shape = Shape(kind: .circle, origin: Vec2(x: 0.0, y: 0.0), width: radii[i], height: radii[i])
+        scale_shape(c.ref, 1.0)
+        raw: any = c
+        unpacked: Shape = cast(Shape, raw)
+        print(str(format: "Circle area (r=%.1f): %.4f", unpacked.width, area(unpacked)))

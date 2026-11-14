@@ -1,0 +1,19 @@
+# List (`list[T]`), Set (`set[T]`), and Dict (`dict[K, V]`) comprehensions in Agila
+import Foundation
+
+def main():
+    # 1. List comprehensions -> Swift `[Int]`
+    squares: list[isize] = [x * x for x in range(1, 7) if x % 2 == 0]
+    all_sq: list[isize] = [i * i for i in range(4)]
+    print(f"List ([Int]): {squares} | all_sq[3]={all_sq[3]}")
+
+    # 2. Set comprehensions -> Swift `Set<Int>`
+    uniq_mods: set[isize] = {x % 4 for x in range(10)}
+    evens: set[isize] = {x for x in range(8) if x % 2 == 0}
+    print(f"Set (count={uniq_mods.count}): sorted={uniq_mods.sorted()} | has_4={evens.contains(4)}")
+
+    # 3. Dict comprehensions -> Swift `[Int: Int]`
+    scaled: dict[isize, isize] = {x: x * 10 for x in squares if x > 0}
+    doubled: dict[isize, isize] = {x: x * 2 for x in squares if x > 0}
+    print(f"Dict (count={scaled.count}): scaled[16]={scaled[16] ?? 0} | doubled[36]={doubled[36] ?? 0}")
+
